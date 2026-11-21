@@ -1,0 +1,31 @@
+name: Milkdrop renderer
+version: "0.1.0"
+slug: odroid_milkdrop
+description: >-
+  Draws the Odroid Winamp remote's Milkdrop visualizer on this machine and
+  streams it to the kiosk, so the Odroid only has to show a small video.
+url: https://github.com/A7QG59F2/ha-milkdrop-renderer
+arch:
+  - amd64
+  - aarch64
+init: false
+startup: application
+boot: auto
+# /dev/dri, so Chromium can draw on the machine's GPU (Intel/AMD, Vulkan)
+video: true
+ports:
+  8098/tcp: 8098
+ports_description:
+  8098/tcp: Visualizer stream (to the kiosk) and audio from the Odroid
+options:
+  width: 640
+  height: 400
+  fps: 30
+  jpeg_quality: 80
+  gpu: true
+schema:
+  width: int(160,1920)
+  height: int(100,1200)
+  fps: int(5,60)
+  jpeg_quality: int(30,95)
+  gpu: bool
