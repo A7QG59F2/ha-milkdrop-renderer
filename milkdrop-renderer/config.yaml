@@ -1,5 +1,5 @@
 name: Milkdrop renderer
-version: "0.1.0"
+version: "0.1.1"
 slug: odroid_milkdrop
 description: >-
   Draws the Odroid Winamp remote's Milkdrop visualizer on this machine and
@@ -13,8 +13,9 @@ startup: application
 boot: auto
 # /dev/dri, so Chromium can draw on the machine's GPU (Intel/AMD, Vulkan)
 video: true
+# 8098 inside, 8097 on the machine: Brassworks Studio has 8098 there
 ports:
-  8098/tcp: 8098
+  8098/tcp: 8097
 ports_description:
   8098/tcp: Visualizer stream (to the kiosk) and audio from the Odroid
 options:
