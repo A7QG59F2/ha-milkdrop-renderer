@@ -15,7 +15,7 @@ itself (slowly) and switches back once the app is running again.
 ## Setup
 
 1. Install and start this app.
-2. On the Odroid, set `MILKDROP_RENDERER="http://<home-assistant-ip>:8098"` in `/etc/odroid-ha/odroid-ha.conf`
+2. On the Odroid, set `MILKDROP_RENDERER="http://<home-assistant-ip>:8097"` in `/etc/odroid-ha/odroid-ha.conf`
    (or answer the `odroid-ha-install --configure` question) and run `odroid-ha-install`.
 
 ## Options
@@ -32,6 +32,8 @@ second at 640×400, so lower the size if that happens. The log names what it dra
 
 ## Network
 
-Port 8098: `/stream` (the picture), `/audio` (the Odroid's link), `/status` (JSON) and `/` (a page to watch
+Port 8097 on the Home Assistant machine (8098 inside the app; Brassworks Studio
+uses 8098 on the machine): `/stream` (the picture), `/audio` (the Odroid's link), `/status` (JSON) and `/` (a page to watch
 the stream in a browser). There's no login: anyone on your network can watch the visualizer or send it audio,
-nothing more.
+nothing more. To use another port, change it under the app's **Network** section and
+change `MILKDROP_RENDERER` on the Odroid to match.
