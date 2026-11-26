@@ -1,5 +1,5 @@
 name: Milkdrop renderer
-version: "0.4.0"
+version: "0.5.0"
 slug: milkdrop_renderer
 description: >-
   Draws the Milkdrop visualizer on this machine's GPU and streams it to a
@@ -46,4 +46,5 @@ schema:
   channels:
     - name: str
       player: str?
+      follow: str?
       audio_device: str?

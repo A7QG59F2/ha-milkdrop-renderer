@@ -121,7 +121,7 @@ async def main():
     await web.TCPSite(runner, "127.0.0.1", MA_PORT).start()
 
     p = start({"music_assistant": f"http://127.0.0.1:{MA_PORT}", "music_assistant_token": "secret",
-               "channels": [{"name": "Garage", "player": "Car-Radio"}, {"name": "Kitchen", "player": "echo-1"},
+               "channels": [{"name": "Garage", "player": "Car-Radio"}, {"name": "Kitchen", "follow": "echo-1"},
                             {"name": "Nowhere", "player": "Nope"}]})
     try:
         await asyncio.sleep(1.5)

@@ -121,7 +121,8 @@ def channel_specs(opts):
         if not cid or cid in seen:
             continue
         seen.add(cid)
-        specs.append({"id": cid, "name": name, "player": str(c.get("player") or "").strip(),
+        player = c.get("player") or c.get("follow")         # `follow` is 0.4.0's name for it
+        specs.append({"id": cid, "name": name, "player": str(player or "").strip(),
                       "device": str(c.get("audio_device") or "")})
         if len(specs) == MAX_CHANNELS:
             break

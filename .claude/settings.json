@@ -36,7 +36,9 @@
       "Bash(git -c * push*:master*)",
       "mcp__github__merge_pull_request",
       "mcp__github__enable_pr_auto_merge",
-      "mcp__github__delete_file"
+      "mcp__github__delete_file",
+      "Bash(gh pr merge*)",
+      "Bash(gh api*/merge*)"
     ]
   }
 }
