@@ -57,11 +57,12 @@ async def main():
         b = next(x for x in st["sources"] if x["id"] == "builtin")
         assert b["name"] == "Visualizer" and st["device"] == "Visualizer", st
         print("listed:", b)
-        # its audio reaches the page as u32 rate + mono int16
+        # its audio reaches the page as channel, kind (1 = PCM), u32 rate + mono int16
         frames = await audio_for(page, 1.0)
         assert frames, "no audio reached the page"
-        rate = struct.unpack("<I", frames[0][:4])[0]
-        samples = struct.unpack(f"<{(len(frames[0]) - 4) // 2}h", frames[0][4:])
+        assert frames[0][:2] == b"\x00\x01", "not marked as channel 0, PCM"
+        rate = struct.unpack("<I", frames[0][2:6])[0]
+        samples = struct.unpack(f"<{(len(frames[0]) - 6) // 2}h", frames[0][6:])
         assert rate == 48000 and max(samples) > 5000, (rate, max(samples))
         print(f"audio ok: {len(frames)} chunks, rate {rate}, peak {max(samples)}")
         # another device chosen: the player isn't heard

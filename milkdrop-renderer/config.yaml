@@ -1,5 +1,5 @@
 name: Milkdrop renderer
-version: "0.3.1"
+version: "0.4.0"
 slug: milkdrop_renderer
 description: >-
   Draws the Milkdrop visualizer on this machine's GPU and streams it to a
@@ -17,7 +17,7 @@ video: true
 ports:
   8098/tcp: 8190
 ports_description:
-  8098/tcp: Visualizer stream (to the kiosk), audio from the device, and /control for settings pages
+  8098/tcp: Visualizer streams (to the kiosks), audio from devices, and /control for settings pages
 options:
   width: 640
   height: 400
@@ -27,6 +27,10 @@ options:
   audio_device: ""
   squeezelite_server: ""
   player_name: Visualizer
+  music_assistant: ""
+  music_assistant_token: ""
+  player: ""
+  channels: []
 schema:
   width: int(160,1920)
   height: int(100,1200)
@@ -36,3 +40,10 @@ schema:
   audio_device: str?
   squeezelite_server: str?
   player_name: str?
+  music_assistant: str?
+  music_assistant_token: password?
+  player: str?
+  channels:
+    - name: str
+      player: str?
+      audio_device: str?
