@@ -1,5 +1,5 @@
 name: Milkdrop renderer
-version: "0.2.1"
+version: "0.3.0"
 slug: milkdrop_renderer
 description: >-
   Draws the Milkdrop visualizer on this machine's GPU and streams it to a
@@ -13,9 +13,9 @@ startup: application
 boot: auto
 # /dev/dri, so Chromium can draw on the machine's GPU (Intel/AMD, Vulkan)
 video: true
-# 8098 inside, 8097 on the machine (another app may use 8098 there)
+# 8098 inside, 8190 on the machine (Music Assistant uses 8097, another app may use 8098)
 ports:
-  8098/tcp: 8097
+  8098/tcp: 8190
 ports_description:
   8098/tcp: Visualizer stream (to the kiosk), audio from the device, and /control for settings pages
 options:
@@ -25,6 +25,8 @@ options:
   jpeg_quality: 80
   gpu: true
   audio_device: ""
+  squeezelite_server: ""
+  player_name: Visualizer
 schema:
   width: int(160,1920)
   height: int(100,1200)
@@ -32,3 +34,5 @@ schema:
   jpeg_quality: int(30,95)
   gpu: bool
   audio_device: str?
+  squeezelite_server: str?
+  player_name: str?

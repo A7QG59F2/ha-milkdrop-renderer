@@ -10,7 +10,8 @@ then install **Milkdrop renderer**. Setup and options: [milkdrop-renderer/DOCS.m
 ## Tests
 
 ```bash
-python3 test/test_audio_device.py   # needs python3-aiohttp; starts renderer.py without Chromium
+python3 test/test_audio_device.py    # needs python3-aiohttp; starts renderer.py without Chromium
+python3 test/test_builtin_player.py  # the built-in player, with a stand-in for Squeezelite
 ```
 
 ## Testing it off Home Assistant
