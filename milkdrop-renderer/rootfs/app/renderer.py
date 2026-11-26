@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Milkdrop renderer for the Odroid C2 Winamp remote.
+"""Milkdrop renderer.
 
-The Odroid's GPU can't run Milkdrop, so it runs here instead:
+A weak device's GPU can't run Milkdrop, so it runs here instead:
 
-  Odroid winamp-server ──ws /audio──▶ this server ──ws /page──▶ headless Chromium
+  audio device ──ws /audio──▶ this server ──ws /page──▶ headless Chromium
       (audio samples, commands)                               (butterchurn, WebGL 2
                                                                on the GPU, or on
                                                                SwiftShader)
@@ -15,10 +15,10 @@ offers is a picture of the music.
 
 Which device the music is heard from: any number of devices may connect to
 /audio, but only one is listened to. It is chosen by name, address or id
-(`audio_device` in the app's options, or from a controller such as Brassworks
-Studio's Winamp settings sheet, which is remembered in /data/state.json and
+(`audio_device` in the app's options, or from a controller such as a settings
+page, which is remembered in /data/state.json and
 wins over the option; an empty choice means "any device", as before). A device
-may say who it is with {"type":"hello","name":"garage"} (or /audio?name=garage);
+may say who it is with {"type":"hello","name":"player-1"} (or /audio?name=player-1);
 otherwise it is known by its address. Devices that aren't listened to are told
 to stop sending ({"type":"want","on":false}) and their commands are ignored.
 
@@ -300,7 +300,7 @@ class Renderer:
 
     async def status_json(self, _request):
         return web.json_response({**self.status, "gl": self.gl, "viewers": len(self.viewers),
-                                  "odroids": len(self.sources), "page": bool(self.page),
+                                  "devices": len(self.sources), "page": bool(self.page),
                                   "device": self.device, "sources": self.source_list()})
 
     # ── headless Chromium, kept running ─────────────────────────────────────
