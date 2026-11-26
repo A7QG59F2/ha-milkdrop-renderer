@@ -22,6 +22,8 @@ Newest first.
   (see DOCS.md). Kiosks for a channel use `/stream?channel=<name>`. Old built-in "Visualizer" player: with channels,
   new ones named "Visualizer <channel>" appear in Music Assistant; the old one can be removed there.
 
+- CLAUDE.md spells out the coworker workflow (branch + PR, Adam merges, Home Assistant changes arrive as files). Permission rules also block `gh pr merge` and merging through the GitHub API.
+  After merging: nothing.
 - Claude Code permission rules (`.claude/settings.json`): branch pushes, new branches and pull requests are allowed; force-pushes, pushes to `main`/`master`, deletes and merges are blocked. Every PR now carries a changelog entry (see CLAUDE.md).
   After merging: nothing.
 
