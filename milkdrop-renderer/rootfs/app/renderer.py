@@ -12,12 +12,27 @@ The Odroid's GPU can't run Milkdrop, so it runs here instead:
 Chromium only draws while somebody watches /stream. Everything runs on one
 port (8098). There's no login: it's meant for the home network, and all it
 offers is a picture of the music.
+
+Which device the music is heard from: any number of devices may connect to
+/audio, but only one is listened to. It is chosen by name, address or id
+(`audio_device` in the app's options, or from a controller such as Brassworks
+Studio's Winamp settings sheet, which is remembered in /data/state.json and
+wins over the option; an empty choice means "any device", as before). A device
+may say who it is with {"type":"hello","name":"garage"} (or /audio?name=garage);
+otherwise it is known by its address. Devices that aren't listened to are told
+to stop sending ({"type":"want","on":false}) and their commands are ignored.
+
+/control is for controllers (no audio): it takes the same commands as /audio's
+text messages plus {"type":"source","device":"<name>"} and sends back the
+renderer's state, so a settings page can show presets, the devices it can hear
+and the tuning.
 """
 import asyncio
 import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
@@ -26,6 +41,9 @@ HERE = Path(__file__).parent
 WWW = HERE / "www"
 PORT = int(os.environ.get("MILKDROP_PORT", "8098"))
 BOUNDARY = "milkdropframe"
+STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/state.json"))
+TUNING = {"cycle": 30, "minFps": 0, "delayMs": 200}   # what render.js starts with
+LIVE_SECONDS = 3                                       # audio this recently = "sending audio"
 
 
 def log(msg):
@@ -34,7 +52,7 @@ def log(msg):
 
 def options():
     """App options from Home Assistant (/data/options.json), or defaults."""
-    opts = {"width": 640, "height": 400, "fps": 30, "jpeg_quality": 80, "gpu": True}
+    opts = {"width": 640, "height": 400, "fps": 30, "jpeg_quality": 80, "gpu": True, "audio_device": ""}
     try:
         opts.update(json.loads(Path(os.environ.get("OPTIONS_FILE", "/data/options.json")).read_text()))
     except (OSError, ValueError):
@@ -42,16 +60,30 @@ def options():
     return opts
 
 
+def load_state():
+    try:
+        x = json.loads(STATE_FILE.read_text())
+        return x if isinstance(x, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 class Renderer:
     def __init__(self, opts):
         self.opts = opts
         self.page = None            # the Chromium page's websocket
-        self.sources = set()        # Odroid winamp-servers (audio + commands)
+        self.sources = {}           # /audio websocket → {id, name, ip, last}: devices that send audio
+        self.controllers = set()    # /control websockets: settings pages
         self.viewers = set()        # /stream responses
         self.frame = None           # latest JPEG
         self.frame_event = asyncio.Event()
         self.status = {"type": "status", "presets": [], "preset": "", "fps": 0}
-        self.settings = {}          # last settings from the Odroid (cycle, delay, …)
+        self.settings = {}          # tuning: cycle, minFps, delayMs (kept in STATE_FILE)
+        state = load_state()
+        # a choice made from a controller wins over the app's option ("" = any device)
+        self.device = str(state["device"]) if isinstance(state.get("device"), str) else str(opts.get("audio_device") or "")
+        if isinstance(state.get("settings"), dict):
+            self.settings = {k: v for k, v in state["settings"].items() if k in TUNING}
         self.chromium = None
         # GPU first (Intel/AMD through /dev/dri, Vulkan); software (SwiftShader)
         # when the GPU gives no WebGL 2. Software is far slower.
@@ -105,34 +137,126 @@ class Renderer:
         if self.page and not self.page.closed:
             await self.page.send_bytes(b)
 
-    # ── the Odroid: audio in, commands in, status out ───────────────────────
+    # ── the devices: audio in, commands in, status out ──────────────────────
+    def wanted(self, info):
+        """Is this the device that is listened to?"""
+        d = self.device.strip().lower()
+        return not d or d in (info["name"].lower(), info["ip"], info["id"])
+
+    def source_list(self):
+        now = time.monotonic()
+        return [{"id": i["id"], "name": i["name"], "ip": i["ip"], "live": now - i["last"] < LIVE_SECONDS}
+                for i in self.sources.values()]
+
+    def control_state(self):
+        return {"type": "control", "device": self.device, "sources": self.source_list(),
+                "settings": {**TUNING, **self.settings}}
+
+    async def send_want(self):
+        """Tell each device whether to send: only the one listened to, and only while somebody watches."""
+        for ws, info in list(self.sources.items()):
+            if not ws.closed:
+                await ws.send_str(json.dumps({"type": "want", "on": bool(self.viewers) and self.wanted(info)}))
+
+    async def to_controllers(self, m):
+        text = json.dumps(m)
+        for ws in list(self.controllers):
+            if not ws.closed:
+                await ws.send_str(text)
+
+    async def control_changed(self):
+        await self.to_controllers(self.control_state())
+
+    def save_state(self):
+        try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            STATE_FILE.write_text(json.dumps({"device": self.device, "settings": self.settings}))
+        except OSError as err:
+            log(f"Could not save {STATE_FILE}: {err}")
+
+    async def command(self, m):
+        """A command from the listened-to device or a controller, for the page."""
+        t = m.get("type")
+        if t == "settings":
+            self.settings = {k: m[k] for k in TUNING if m.get(k) is not None}
+            self.save_state()
+            await self.control_changed()
+        await self.to_page(m)          # next / prev / preset / title / settings / forget_slow
+
     async def audio_ws(self, request):
         ws = web.WebSocketResponse(heartbeat=30, max_msg_size=1 << 20)
         await ws.prepare(request)
-        self.sources.add(ws)
-        log(f"Odroid connected from {request.remote}")
+        ip = request.remote or ""
+        info = {"id": f"{ip}#{len(self.sources) + 1}", "ip": ip, "last": 0.0,
+                "name": (request.query.get("name") or "").strip()[:60] or ip}
+        self.sources[ws] = info
+        log(f"{info['name']} connected to /audio" + ("" if self.wanted(info) else " (not the device listened to)"))
         await ws.send_str(json.dumps(self.status))
-        await ws.send_str(json.dumps({"type": "want", "on": bool(self.viewers)}))
+        await ws.send_str(json.dumps({"type": "want", "on": bool(self.viewers) and self.wanted(info)}))
+        await self.control_changed()
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
-                    if self.viewers:
+                    info["last"] = time.monotonic()
+                    if self.viewers and self.wanted(info):
                         await self.to_page_bytes(msg.data)
                 elif msg.type == WSMsgType.TEXT:
                     m = json.loads(msg.data)
-                    if m.get("type") == "settings":
-                        self.settings = {k: v for k, v in m.items() if k != "type"}
-                    await self.to_page(m)          # next / prev / preset / title / settings
+                    if m.get("type") == "hello":
+                        info["name"] = str(m.get("name") or "").strip()[:60] or info["ip"]
+                        await self.send_want()
+                        await self.control_changed()
+                    elif self.wanted(info):
+                        await self.command(m)
         finally:
-            self.sources.discard(ws)
-            log("Odroid disconnected")
+            self.sources.pop(ws, None)
+            log(f"{info['name']} disconnected from /audio")
+            await self.control_changed()
+        return ws
+
+    # ── controllers (a settings page): commands in, state out ───────────────
+    async def control_ws(self, request):
+        ws = web.WebSocketResponse(heartbeat=30, max_msg_size=1 << 16)
+        await ws.prepare(request)
+        self.controllers.add(ws)
+        await ws.send_str(json.dumps(self.control_state()))
+        await ws.send_str(json.dumps(self.status))
+        try:
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                try:
+                    m = json.loads(msg.data)
+                except ValueError:
+                    continue
+                if not isinstance(m, dict):
+                    continue
+                if m.get("type") == "source":
+                    self.device = str(m.get("device") or "").strip()[:60]
+                    log(f"Audio is now heard from: {self.device or 'any device'}")
+                    self.save_state()
+                    await self.send_want()
+                    await self.control_changed()
+                elif m.get("type") in ("settings", "next", "prev", "preset", "forget_slow", "title"):
+                    await self.command(m)
+        finally:
+            self.controllers.discard(ws)
         return ws
 
     async def to_sources(self, m):
+        """The renderer's status, to every device and every controller."""
         text = json.dumps(m)
         for ws in list(self.sources):
             if not ws.closed:
                 await ws.send_str(text)
+        await self.to_controllers(m)
+
+    async def ticker(self):
+        """Controllers see which devices are sending audio right now."""
+        while True:
+            await asyncio.sleep(2)
+            if self.controllers:
+                await self.control_changed()
 
     # ── the picture: MJPEG for the kiosk's <img> ────────────────────────────
     async def stream(self, request):
@@ -166,7 +290,7 @@ class Renderer:
         on = bool(self.viewers)
         log("Streaming" if on else "No viewers: paused")
         await self.to_page({"type": "run", "on": on})
-        await self.to_sources({"type": "want", "on": on})
+        await self.send_want()
 
     async def index(self, _request):
         return web.Response(content_type="text/html", text=(
@@ -176,7 +300,8 @@ class Renderer:
 
     async def status_json(self, _request):
         return web.json_response({**self.status, "gl": self.gl, "viewers": len(self.viewers),
-                                  "odroids": len(self.sources), "page": bool(self.page)})
+                                  "odroids": len(self.sources), "page": bool(self.page),
+                                  "device": self.device, "sources": self.source_list()})
 
     # ── headless Chromium, kept running ─────────────────────────────────────
     async def run_chromium(self):
@@ -211,9 +336,11 @@ class Renderer:
 
     async def start(self, app):
         app["chromium"] = asyncio.create_task(self.run_chromium())
+        app["ticker"] = asyncio.create_task(self.ticker())
 
     async def stop(self, app):
         app["chromium"].cancel()
+        app["ticker"].cancel()
         if self.chromium and self.chromium.returncode is None:
             self.chromium.kill()
 
@@ -226,6 +353,7 @@ def main():
     app.router.add_get("/stream", r.stream)
     app.router.add_get("/status", r.status_json)
     app.router.add_get("/audio", r.audio_ws)
+    app.router.add_get("/control", r.control_ws)
     app.router.add_get("/page", r.page_ws)
     app.router.add_static("/", WWW)
     app.on_startup.append(r.start)
