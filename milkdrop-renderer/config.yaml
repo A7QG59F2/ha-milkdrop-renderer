@@ -1,5 +1,5 @@
 name: Milkdrop renderer
-version: "0.1.1"
+version: "0.2.0"
 slug: odroid_milkdrop
 description: >-
   Draws the Odroid Winamp remote's Milkdrop visualizer on this machine and
@@ -17,16 +17,18 @@ video: true
 ports:
   8098/tcp: 8097
 ports_description:
-  8098/tcp: Visualizer stream (to the kiosk) and audio from the Odroid
+  8098/tcp: Visualizer stream (to the kiosk), audio from the device, and /control for settings pages
 options:
   width: 640
   height: 400
   fps: 30
   jpeg_quality: 80
   gpu: true
+  audio_device: ""
 schema:
   width: int(160,1920)
   height: int(100,1200)
   fps: int(5,60)
   jpeg_quality: int(30,95)
   gpu: bool
+  audio_device: str?

@@ -7,6 +7,12 @@ Odroid's kiosk.
 Add it in **Settings → Apps → App store → ⋮ → Repositories** with `https://github.com/A7QG59F2/ha-milkdrop-renderer`,
 then install **Milkdrop renderer**. Setup and options: [milkdrop-renderer/DOCS.md](milkdrop-renderer/DOCS.md).
 
+## Tests
+
+```bash
+python3 test/test_audio_device.py   # needs python3-aiohttp; starts renderer.py without Chromium
+```
+
 ## Testing it off Home Assistant
 
 `renderer.py` runs anywhere with Python, aiohttp and Chromium/Chrome:
