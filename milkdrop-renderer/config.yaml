@@ -1,5 +1,5 @@
 name: Milkdrop renderer
-version: "0.3.1"
+version: "0.4.0"
 slug: milkdrop_renderer
 description: >-
   Draws the Milkdrop visualizer on this machine's GPU and streams it to a
@@ -27,6 +27,9 @@ options:
   audio_device: ""
   squeezelite_server: ""
   player_name: Visualizer
+  music_assistant: ""
+  music_assistant_token: ""
+  channels: []
 schema:
   width: int(160,1920)
   height: int(100,1200)
@@ -36,3 +39,10 @@ schema:
   audio_device: str?
   squeezelite_server: str?
   player_name: str?
+  music_assistant: str?
+  music_assistant_token: password?
+  channels:
+    - name: str
+      follow: str?
+      mode: list(auto|sync|mirror)?
+      audio_device: str?

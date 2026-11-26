@@ -69,7 +69,7 @@ async def main():
             j = await r.json()
             assert "sources" in j and j["device"] == "", j
     p.kill(); p.wait()
-    state = json.load(open(f"{tmp}/state.json"))
+    state = json.load(open(f"{tmp}/state.json"))["channels"]["main"]
     assert state["device"] == "" and state["settings"] == {"cycle": 45, "minFps": 12, "delayMs": 300}, state
     print("state saved:", state)
     # restart: the controller's choice (any device, '') beats the option ("player-1"); tuning is back
@@ -79,6 +79,15 @@ async def main():
         st = await recv_until(ctl, lambda m: m["type"] == "control")
         assert st["device"] == "" and st["settings"]["cycle"] == 45, st
         print("after restart:", st["device"] or "any device", st["settings"])
+    p.kill(); p.wait()
+    # a state file from 0.3.x (no channels) is still read
+    json.dump({"device": "player-2", "settings": {"cycle": 50}, "mac": "02:11:22:33:44:55"}, open(f"{tmp}/state.json", "w"))
+    p = start(); await asyncio.sleep(1.5)
+    async with aiohttp.ClientSession() as s:
+        ctl = await s.ws_connect(f"{base}/control")
+        st = await recv_until(ctl, lambda m: m["type"] == "control")
+        assert st["device"] == "player-2" and st["settings"]["cycle"] == 50 and st["channel"] == "main", st
+        print("old state file read")
     p.kill(); p.wait()
     print("ALL OK")
 
