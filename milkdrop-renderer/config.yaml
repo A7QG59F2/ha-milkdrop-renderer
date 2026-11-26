@@ -1,5 +1,5 @@
 name: Milkdrop renderer
-version: "0.3.0"
+version: "0.3.1"
 slug: milkdrop_renderer
 description: >-
   Draws the Milkdrop visualizer on this machine's GPU and streams it to a

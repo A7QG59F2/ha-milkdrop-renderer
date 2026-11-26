@@ -1,8 +1,10 @@
 """The built-in Squeezelite player: it becomes a device that can be listened to, its audio reaches the
 page in the same shape as a device's, and it isn't heard when another device is chosen.
 Runs the real renderer.py; Squeezelite is a stand-in (test/fake_squeezelite.py). Needs python3-aiohttp.
-Run: python3 test/test_builtin_player.py"""
-import asyncio, json, os, struct, subprocess, sys, tempfile, time
+Run: python3 test/test_builtin_player.py
+Also run it as FALSY_WS=1 python3 test/test_builtin_player.py: a WebSocket object then counts as "false",
+as it does in older aiohttp (the Home Assistant image's), which must change nothing."""
+import asyncio, atexit, json, os, struct, subprocess, sys, tempfile, time
 import aiohttp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -11,11 +13,15 @@ tmp = tempfile.mkdtemp()
 env = {**os.environ, "MILKDROP_PORT": "18099", "MILKDROP_HOST": "127.0.0.1", "STATE_FILE": f"{tmp}/state.json",
        "OPTIONS_FILE": f"{tmp}/opts.json", "CHROMIUM_BIN": "/bin/false",
        "SQUEEZELITE_BIN": os.path.join(HERE, "fake_squeezelite.py"), "FAKE_ARGS": f"{tmp}/args.txt"}
+if os.environ.get("FALSY_WS"):
+    env["PYTHONPATH"] = os.path.join(HERE, "falsy_ws")
 BASE = "http://127.0.0.1:18099"
 
 def start(opts):
     open(f"{tmp}/opts.json", "w").write(json.dumps(opts))
-    return subprocess.Popen([sys.executable, APP], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen([sys.executable, APP], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    atexit.register(proc.kill)                           # never leave one running after a failed test
+    return proc
 
 async def next_json(ws, pred, secs=4):
     end = time.time() + secs
