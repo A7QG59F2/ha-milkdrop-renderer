@@ -13,6 +13,12 @@ Chromium only draws while somebody watches /stream. Everything runs on one
 port (8098). There's no login: it's meant for the home network, and all it
 offers is a picture of the music.
 
+The built-in player: with `squeezelite_server` set (the address of a Music
+Assistant / Lyrion server), the app also runs Squeezelite as a player named
+`player_name` that outputs no sound; its audio feeds the visualizer as one more
+device ("built-in player"). Group it with the real player in Music Assistant and
+the visualizer follows what that player plays.
+
 Which device the music is heard from: any number of devices may connect to
 /audio, but only one is listened to. It is chosen by name, address or id
 (`audio_device` in the app's options, or from a controller such as a settings
@@ -30,9 +36,12 @@ and the tuning.
 import asyncio
 import json
 import os
+import random
 import shutil
+import struct
 import sys
 import time
+from array import array
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
@@ -44,6 +53,7 @@ BOUNDARY = "milkdropframe"
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/state.json"))
 TUNING = {"cycle": 30, "minFps": 0, "delayMs": 200}   # what render.js starts with
 LIVE_SECONDS = 3                                       # audio this recently = "sending audio"
+PLAYER_RATE = 48000                                    # the built-in player always plays at this rate
 
 
 def log(msg):
@@ -52,7 +62,8 @@ def log(msg):
 
 def options():
     """App options from Home Assistant (/data/options.json), or defaults."""
-    opts = {"width": 640, "height": 400, "fps": 30, "jpeg_quality": 80, "gpu": True, "audio_device": ""}
+    opts = {"width": 640, "height": 400, "fps": 30, "jpeg_quality": 80, "gpu": True, "audio_device": "",
+            "squeezelite_server": "", "player_name": "Visualizer"}
     try:
         opts.update(json.loads(Path(os.environ.get("OPTIONS_FILE", "/data/options.json")).read_text()))
     except (OSError, ValueError):
@@ -81,6 +92,12 @@ class Renderer:
         self.settings = {}          # tuning: cycle, minFps, delayMs (kept in STATE_FILE)
         state = load_state()
         # a choice made from a controller wins over the app's option ("" = any device)
+        self.mac = state["mac"] if isinstance(state.get("mac"), str) else ""
+        server = str(opts.get("squeezelite_server") or "").strip()
+        name = (str(opts.get("player_name") or "").strip() or "Visualizer")[:60]
+        # the built-in player, one more device that can be listened to (None: switched off)
+        self.builtin = {"id": "builtin", "name": name, "ip": "built-in player", "last": 0.0, "server": server} if server else None
+        self.player = None          # the Squeezelite process
         self.device = str(state["device"]) if isinstance(state.get("device"), str) else str(opts.get("audio_device") or "")
         if isinstance(state.get("settings"), dict):
             self.settings = {k: v for k, v in state["settings"].items() if k in TUNING}
@@ -145,8 +162,9 @@ class Renderer:
 
     def source_list(self):
         now = time.monotonic()
+        infos = list(self.sources.values()) + ([self.builtin] if self.builtin else [])
         return [{"id": i["id"], "name": i["name"], "ip": i["ip"], "live": now - i["last"] < LIVE_SECONDS}
-                for i in self.sources.values()]
+                for i in infos]
 
     def control_state(self):
         return {"type": "control", "device": self.device, "sources": self.source_list(),
@@ -170,7 +188,7 @@ class Renderer:
     def save_state(self):
         try:
             STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            STATE_FILE.write_text(json.dumps({"device": self.device, "settings": self.settings}))
+            STATE_FILE.write_text(json.dumps({"device": self.device, "settings": self.settings, "mac": self.mac}))
         except OSError as err:
             log(f"Could not save {STATE_FILE}: {err}")
 
@@ -258,6 +276,67 @@ class Renderer:
             if self.controllers:
                 await self.control_changed()
 
+    # ── the built-in player: Squeezelite as a Music Assistant player ────────
+    def player_mac(self):
+        """A fixed made-up MAC, so Music Assistant sees the same player after every restart."""
+        if not self.mac:
+            self.mac = "02:" + ":".join(f"{random.randrange(256):02x}" for _ in range(5))
+            self.save_state()
+        return self.mac
+
+    async def feed(self, stereo):
+        """Stereo 16-bit samples from the player → the page, as the /audio devices send them (u32 rate + mono int16)."""
+        a = array("h")
+        a.frombytes(stereo)
+        if sys.byteorder == "big":
+            a.byteswap()
+        mono = array("h", [(left + right) >> 1 for left, right in zip(a[0::2], a[1::2])])
+        loud = bool(mono) and max(max(mono), -min(mono)) > 8      # real sound, not silence
+        if loud:
+            self.builtin["last"] = time.monotonic()
+        # with "any device" the player's silence must not break up another device's audio
+        if self.viewers and self.wanted(self.builtin) and (loud or self.device.strip()):
+            await self.to_page_bytes(struct.pack("<I", PLAYER_RATE) + mono.tobytes())
+
+    async def run_player(self):
+        if not self.builtin:
+            return
+        exe = os.environ.get("SQUEEZELITE_BIN") or shutil.which("squeezelite")
+        if not exe:
+            log("squeezelite_server is set but Squeezelite isn't installed")
+            return
+        while True:
+            args = [exe, "-n", self.builtin["name"], "-s", self.builtin["server"], "-m", self.player_mac(),
+                    "-o", "-", "-a", "16", "-r", f"{PLAYER_RATE}-{PLAYER_RATE}"]
+            log(f"Built-in player \"{self.builtin['name']}\" connecting to {self.builtin['server']}")
+            self.player = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            logs = asyncio.create_task(self.player_log(self.player.stderr))
+            try:
+                pending = b""
+                while True:
+                    chunk = await self.player.stdout.read(8192)
+                    if not chunk:
+                        break
+                    pending += chunk
+                    whole = len(pending) - len(pending) % 4         # whole stereo frames only
+                    if whole:
+                        await self.feed(pending[:whole])
+                        pending = pending[whole:]
+            finally:
+                logs.cancel()
+            rc = await self.player.wait()
+            log(f"Built-in player exited ({rc}), restarting in 5 s")
+            await asyncio.sleep(5)
+
+    async def player_log(self, stream):
+        n = 0
+        async for line in stream:
+            text = line.decode(errors="replace").strip()
+            if text and n < 200:                                    # Squeezelite is chatty when it misbehaves
+                n += 1
+                log(f"squeezelite: {text}")
+
     # ── the picture: MJPEG for the kiosk's <img> ────────────────────────────
     async def stream(self, request):
         resp = web.StreamResponse(headers={
@@ -337,10 +416,14 @@ class Renderer:
     async def start(self, app):
         app["chromium"] = asyncio.create_task(self.run_chromium())
         app["ticker"] = asyncio.create_task(self.ticker())
+        app["player"] = asyncio.create_task(self.run_player())
 
     async def stop(self, app):
         app["chromium"].cancel()
         app["ticker"].cancel()
+        app["player"].cancel()
+        if self.player and self.player.returncode is None:
+            self.player.kill()
         if self.chromium and self.chromium.returncode is None:
             self.chromium.kill()
 

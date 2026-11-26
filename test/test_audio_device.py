@@ -68,7 +68,7 @@ async def main():
             assert "sources" in j and j["device"] == "", j
     p.kill(); p.wait()
     state = json.load(open(f"{tmp}/state.json"))
-    assert state == {"device": "", "settings": {"cycle": 45, "minFps": 12, "delayMs": 300}}, state
+    assert state["device"] == "" and state["settings"] == {"cycle": 45, "minFps": 12, "delayMs": 300}, state
     print("state saved:", state)
     # restart: the controller's choice (any device, '') beats the option ("player-1"); tuning is back
     p = start(); await asyncio.sleep(1.5)
