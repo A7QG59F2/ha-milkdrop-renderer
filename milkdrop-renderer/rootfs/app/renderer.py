@@ -3,54 +3,46 @@
 
 A weak device's GPU can't run Milkdrop, so it runs here instead:
 
-  audio device ──ws /audio──▶ this server ──ws /page──▶ headless Chromium
-      (audio samples, commands)                               (butterchurn, WebGL 2
-                                                               on the GPU, or on
-                                                               SwiftShader)
-  kiosk <img src=/stream> ◀── MJPEG ── this server ◀── JPEG frames ──┘
+  Music Assistant's MilkDrop Visualizer plugin ─ws─┐
+  audio device ──ws /audio──────────────────────────┼─▶ this server ──ws /page──▶ headless Chromium
+                                                    │                            (butterchurn, WebGL 2)
+  kiosk <img src=/stream?channel=…> ◀── MJPEG ── this server ◀── JPEG frames ──┘
 
-Channels: the app can draw several visualizers at once, one per channel, so two
-speakers playing different music each get their own. A channel has its own
-Milkdrop (one canvas in the same Chromium page), its own stream
-(/stream?channel=garage), its own devices, settings pages and tuning, and its
-own built-in player. Without `channels` in the options there is one channel,
-"main", that behaves exactly as before. Every URL without ?channel= means the
-first channel.
+Channels: several visualizers at once, one per channel, so two speakers playing
+different music each get their own. A channel has its own Milkdrop (a canvas in
+the same Chromium page), its own stream (/stream?channel=garage), devices,
+settings pages and tuning. Without `channels` in the options there is one
+channel, "main", that behaves as before. A URL without ?channel= means the first
+channel. A channel only draws while somebody watches it.
 
-The built-in player: with a Music Assistant (or Lyrion) server known, each
-channel runs Squeezelite as a player that outputs no sound; its audio feeds that
-channel as one more device ("built-in player").
+Following a Music Assistant player: a channel's `player` names one (by name or
+id). While the channel is watched, the app subscribes to that player's waveform
+from Music Assistant's own MilkDrop Visualizer plugin
+(ws://<ma>:8095/milkdrop_visualizer?player=<id>). The plugin reads the audio
+Music Assistant is already decoding for the player, so it works for any player
+(Squeezelite, Echo, Cast, Sendspin, …) without grouping, extra players or a
+second stream. Each frame carries the time (on Music Assistant's clock) it is
+heard at; the app syncs to that clock and hands Chromium each frame when it is
+due, plus the delay setting. Beats from the plugin make preset changes land on a
+beat.
 
-Following a speaker: with `music_assistant` (and its token) set, a channel's
-`follow` names a Music Assistant player. While that speaker plays and somebody
-watches the channel, the app makes its built-in player hear the same music:
-
-  sync    the built-in player joins the speaker's sync group (Squeezelite
-          speakers such as the JVC radio): sample-accurate, MA does the work.
-  mirror  for speakers it can't sync with (Echo, Cast, …): the built-in player
-          plays the same track at the same position on its own queue, and the
-          app keeps correcting drift. The delay setting covers the speaker's lag.
-
-`mode: auto` (the default) tries sync and falls back to mirror. When the speaker
-stops, or nobody has watched for a while, the app ungroups / stops its player.
-
-Which device a channel hears: any number of devices may connect to
-/audio?channel=…, but each channel listens to only one, chosen by name, address
-or id (`audio_device`, or from a settings page, which is remembered in
-/data/state.json and wins over the option; empty = any device). Devices that
-aren't listened to are told to stop sending ({"type":"want","on":false}) and
-their commands are ignored. A channel that follows a speaker listens to its
-built-in player unless a settings page chose otherwise.
+Other sources, as before: devices that send their own audio to /audio, and the
+built-in Squeezelite player (`squeezelite_server`, the single-channel setup only).
+A channel listens to one of them, chosen by name, address or id (`audio_device`,
+or from a settings page, which is remembered in /data/state.json and wins over the
+option; empty = any device). A channel with a `player` hears it unless a device is
+chosen.
 
 /control?channel=… is for settings pages (no audio): it takes the same commands
 as /audio's text messages plus {"type":"source","device":"<name>"} and sends back
 that channel's state.
 
-The page link (/page) carries every channel: text messages have "ch" (the
-channel's index); binary messages start with one byte, the channel's index.
+The page link (/page): text messages carry "ch" (the channel's index); binary
+messages are [ch][kind][data], kind 1 = PCM (u32 rate + int16 mono), 2 = a
+waveform (1024 × uint8, 128 = silence), 3 = a beat (flags, bit 0 = downbeat).
 """
 import asyncio
-import itertools
+import collections
 import json
 import os
 import random
@@ -74,9 +66,9 @@ TUNING = {"cycle": 30, "minFps": 0, "delayMs": 200}   # what render.js starts wi
 LIVE_SECONDS = 3                                       # audio this recently = "sending audio"
 PLAYER_RATE = 48000                                    # the built-in player always plays at this rate
 MAX_CHANNELS = 8
-FOLLOW_GRACE = float(os.environ.get("FOLLOW_GRACE", "30"))  # keep following this long after the last viewer
-FOLLOW_EVERY = float(os.environ.get("FOLLOW_EVERY", "5"))   # check the followed speaker at least this often
-MIRROR_DRIFT = 4                                       # seconds off before the mirror seeks
+GRACE = float(os.environ.get("FEED_GRACE", "30"))      # keep the plugin feed this long after the last viewer
+PCM, WAVE, BEAT = 1, 2, 3                              # kinds of binary message to the page
+WAVE_TAG, BEAT_TAG = 22, 17                            # the plugin's binary frames
 
 
 def log(msg):
@@ -107,26 +99,18 @@ def slug(name):
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40]
 
 
-def host_of(addr):
-    """'http://192.0.2.5:8095/' → '192.0.2.5'."""
-    a = re.sub(r"^[a-z]+://", "", addr.strip()).split("/")[0]
-    if a.startswith("["):
-        return a.split("]")[0] + "]"
-    return a.rsplit(":", 1)[0] if a.count(":") == 1 else a
-
-
-def ma_ws_url(addr):
-    """'192.0.2.5', '192.0.2.5:8095' or 'http://192.0.2.5:8095' → 'ws://192.0.2.5:8095/ws'."""
+def ma_base(addr):
+    """'192.0.2.5', '192.0.2.5:8095' or 'http://192.0.2.5:8095/' → 'ws://192.0.2.5:8095'."""
     a = addr.strip().rstrip("/")
-    a = re.sub(r"^http", "ws", a) if re.match(r"^https?://", a) else "ws://" + a
+    a = re.sub(r"^http", "ws", a) if re.match(r"^(https?|wss?)://", a) else "ws://" + a
     hostpart = re.sub(r"^wss?://", "", a).split("/")[0]
     if not re.search(r":\d+$", hostpart):
         a = a.replace(hostpart, hostpart + ":8095", 1)
-    return a if a.endswith("/ws") else a + "/ws"
+    return re.sub(r"/ws$", "", a)
 
 
 def channel_specs(opts):
-    """The channels from the options: [{id, name, follow, mode, device}]; one 'main' channel when none are given."""
+    """The channels from the options: [{id, name, player, device}]; one 'main' channel when none are given."""
     raw = opts.get("channels") if isinstance(opts.get("channels"), list) else []
     specs, seen = [], set()
     for c in raw:
@@ -137,206 +121,245 @@ def channel_specs(opts):
         if not cid or cid in seen:
             continue
         seen.add(cid)
-        mode = str(c.get("mode") or "auto").strip().lower()
-        specs.append({"id": cid, "name": name, "follow": str(c.get("follow") or "").strip(),
-                      "mode": mode if mode in ("auto", "sync", "mirror") else "auto",
+        player = c.get("player") or c.get("follow")         # `follow` is 0.4.0's name for it
+        specs.append({"id": cid, "name": name, "player": str(player or "").strip(),
                       "device": str(c.get("audio_device") or "")})
         if len(specs) == MAX_CHANNELS:
             break
     if not specs:
-        specs = [{"id": "main", "name": "", "follow": "", "mode": "auto", "device": str(opts.get("audio_device") or "")}]
+        specs = [{"id": "main", "name": "", "player": str(opts.get("player") or "").strip(),
+                  "device": str(opts.get("audio_device") or "")}]
     return specs
 
 
-class MAError(Exception):
-    pass
-
-
 class MusicAssistant:
-    """A small client for Music Assistant's WebSocket API: players, their events, and commands."""
+    """What the app needs from Music Assistant: its address, the token, and player ids by name."""
 
-    def __init__(self, addr, token, on_change):
-        self.url = ma_ws_url(addr)
+    def __init__(self, addr, token):
+        self.base = ma_base(addr)
         self.token = token
-        self.on_change = on_change      # called with a player_id / queue_id when something changes
-        self.ws = None
-        self.ready = False
-        self.players = {}
-        self.ids = itertools.count(1)
-        self.waiting = {}
-        self.partial = {}
-        self.error = ""
+        self.ids = {}                   # name (lower case) or id → player_id
 
-    async def call(self, command, **args):
-        if self.ws is None or self.ws.closed:
-            raise MAError("not connected to Music Assistant")
-        mid = str(next(self.ids))
-        fut = asyncio.get_running_loop().create_future()
-        self.waiting[mid] = fut
-        try:
-            await self.ws.send_str(json.dumps({"message_id": mid, "command": command, "args": args}))
-            return await asyncio.wait_for(fut, 15)
-        except asyncio.TimeoutError:
-            raise MAError(f"{command}: no answer") from None
-        finally:
-            self.waiting.pop(mid, None)
-
-    def find(self, key):
-        """A player by id or name (case-insensitive)."""
+    async def player_id(self, key, refresh=False):
+        """A player's id, from its name or id (asks Music Assistant's API once, then remembers)."""
         k = key.strip().lower()
-        if not k:
-            return None
-        for p in self.players.values():
-            if p.get("player_id", "").lower() == k:
-                return p
-        for p in self.players.values():
-            if (p.get("name") or "").strip().lower() == k or (p.get("display_name") or "").strip().lower() == k:
-                return p
-        return None
+        if refresh or k not in self.ids:
+            async with aiohttp.ClientSession() as s, s.ws_connect(f"{self.base}/ws", heartbeat=30,
+                                                                   max_msg_size=32 << 20) as ws:
+                await ws.send_str(json.dumps({"message_id": "auth", "command": "auth", "args": {"token": self.token}}))
+                await ws.send_str(json.dumps({"message_id": "players", "command": "players/all"}))
+                players = []
+                async for msg in ws:
+                    if msg.type != WSMsgType.TEXT:
+                        continue
+                    m = json.loads(msg.data)
+                    if m.get("message_id") in ("auth", "players", "connection") and "error_code" in m:
+                        raise RuntimeError(f"Music Assistant: {m.get('details') or m['error_code']}")
+                    if m.get("message_id") == "players":
+                        players += list(m.get("result") or [])
+                        if not m.get("partial"):
+                            break
+            self.ids = {}
+            for p in players:
+                pid = p.get("player_id")
+                if pid:
+                    for n in (pid, p.get("name"), p.get("display_name")):
+                        if n:
+                            self.ids.setdefault(str(n).strip().lower(), pid)
+        return self.ids.get(k)
 
-    def find_own(self, name, mac):
-        """The built-in player: Squeezelite's player_id is its MAC; failing that, its name."""
-        m = mac.lower()
-        for p in self.players.values():
-            if p.get("player_id", "").lower() == m:
-                return p
-        return self.find(name)
+
+class PluginFeed:
+    """One channel's subscription to the MilkDrop Visualizer plugin: frames in, scheduled out to the page."""
+
+    def __init__(self, channel):
+        self.c = channel
+        self.state = "off"
+        self.error = ""
+        self.offset_us = 0              # Music Assistant's clock minus ours
+        self.best_rtt = None
+        self.waves = collections.deque()
+        self.beats = collections.deque()
+
+    @staticmethod
+    def now_us():
+        return int(time.monotonic() * 1_000_000)
+
+    async def set_state(self, s):
+        if s != self.state:
+            self.state = s
+            log(f"{self.c.label()} ← {self.c.player}: {s}")
+            await self.c.control_changed()
+
+    def due(self, ts):
+        """When a frame stamped with Music Assistant's time is heard, on our clock, plus the delay setting."""
+        return ts - self.offset_us + int(float(self.c.tuning()["delayMs"]) * 1000)
 
     async def run(self):
+        """Keep the feed while the channel is watched (and a little longer), retrying when it drops."""
+        ma = self.c.r.ma
+        if ma is None:
+            return await self.set_state("needs music_assistant and music_assistant_token in the options")
         while True:
+            if not self.c.watched():
+                await self.set_state("idle (nobody watching)")
+                await self.c.watch_event.wait()
+                continue
             try:
-                async with aiohttp.ClientSession() as s, s.ws_connect(self.url, heartbeat=30,
-                                                                       max_msg_size=32 << 20) as ws:
-                    self.ws = ws
-                    reader = asyncio.create_task(self.read(ws))
-                    try:
-                        await self.hello()
-                        await reader
-                    finally:
-                        reader.cancel()
+                pid = await ma.player_id(self.c.player) or await ma.player_id(self.c.player, refresh=True)
+                if not pid:
+                    await self.set_state(f"no player called {self.c.player} in Music Assistant")
+                else:
+                    await self.session(ma, pid)
             except asyncio.CancelledError:
                 raise
-            except Exception as err:      # noqa: BLE001 - keep retrying whatever went wrong
-                msg = str(err) or type(err).__name__
-                if msg != self.error:
-                    log(f"Music Assistant ({self.url}): {msg}")
-                self.error = msg
-            self.ws, self.ready = None, False
-            for fut in self.waiting.values():
-                if not fut.done():
-                    fut.set_exception(MAError("disconnected"))
-            self.on_change(None)
-            await asyncio.sleep(10)
+            except Exception as err:          # noqa: BLE001 - report and retry whatever went wrong
+                await self.set_state(f"error: {str(err) or type(err).__name__}")
+            await asyncio.sleep(5)
 
-    async def hello(self):
-        if self.token:
-            await self.call("auth", token=self.token)
-        players = await self.call("players/all")
-        self.players = {p["player_id"]: p for p in players or [] if isinstance(p, dict) and p.get("player_id")}
-        self.ready, self.error = True, ""
-        log(f"Music Assistant connected: {len(self.players)} players")
-        self.on_change(None)
-
-    async def read(self, ws):
-        async for msg in ws:
-            if msg.type != WSMsgType.TEXT:
-                continue
+    async def session(self, ma, pid):
+        url = f"{ma.base}/milkdrop_visualizer?player={pid}"
+        async with aiohttp.ClientSession() as s, s.ws_connect(url, heartbeat=25, max_msg_size=1 << 20) as ws:
+            await ws.send_str(json.dumps({"type": "auth", "token": ma.token}))
+            self.best_rtt = None
+            self.waves.clear()
+            self.beats.clear()
+            tasks = [asyncio.create_task(self.pinger(ws)), asyncio.create_task(self.pump())]
             try:
-                m = json.loads(msg.data)
-            except ValueError:
+                async for msg in ws:
+                    if msg.type == WSMsgType.BINARY:
+                        self.frame(msg.data)
+                    elif msg.type == WSMsgType.TEXT:
+                        await self.text(json.loads(msg.data))
+                    if not self.c.watched():
+                        await ws.send_str(json.dumps({"type": "client/goodbye"}))
+                        break
+                if ws.close_code == 4001:
+                    raise RuntimeError(f"Music Assistant refused the token ({ws.exception() or 'invalid'})")
+                if ws.close_code and ws.close_code >= 4000:
+                    raise RuntimeError(f"closed by Music Assistant ({ws.close_code})")
+            finally:
+                for t in tasks:
+                    t.cancel()
+        if not self.c.watched():
+            return
+        raise RuntimeError("Music Assistant closed the visualizer feed (is the MilkDrop Visualizer plugin on?)")
+
+    def frame(self, b):
+        if len(b) >= 9 + 1024 and b[0] == WAVE_TAG:
+            ts = struct.unpack_from(">q", b, 1)[0]
+            if self.waves and ts < self.waves[-1][0]:
+                self.waves.clear()                     # the timeline jumped back (a seek)
+            self.waves.append((ts, b[9:9 + 1024]))
+        elif len(b) >= 10 and b[0] == BEAT_TAG:
+            ts = struct.unpack_from(">q", b, 1)[0]
+            if not self.beats or ts > self.beats[-1][0]:
+                self.beats.append((ts, b[9:10]))
+
+    async def text(self, m):
+        t = m.get("type")
+        if t == "auth_ok":
+            await self.set_state("connected")
+        elif t == "server/time":
+            p = m.get("payload") or {}
+            t1 = self.now_us()
+            t0 = int(p.get("client_transmitted", t1))
+            rtt = t1 - t0
+            if self.best_rtt is None or rtt <= self.best_rtt * 1.5:
+                self.best_rtt = rtt if self.best_rtt is None else min(self.best_rtt, rtt)
+                self.offset_us = int(p.get("server_received", t0)) - (t0 + t1) // 2
+        elif t in ("stream/start", "stream/clear", "stream/end"):
+            self.waves.clear()
+            self.beats.clear()
+            if t == "stream/start":
+                await self.set_state("streaming")
+        elif t == "error":
+            raise RuntimeError(m.get("message") or "error")
+
+    async def pinger(self, ws):
+        """Time sync with Music Assistant's clock: a burst at the start, then now and then."""
+        n = 0
+        while not ws.closed:
+            await ws.send_str(json.dumps({"type": "client/time", "payload": {"client_transmitted": self.now_us()}}))
+            n += 1
+            await asyncio.sleep(0.2 if n < 8 else 10)
+
+    async def pump(self):
+        """Hand the page the newest waveform that is due, and each beat as it comes due (~60 times a second)."""
+        while True:
+            await asyncio.sleep(1 / 60)
+            if not self.c.viewers or not self.c.wanted(self.c.plugin_info):
                 continue
-            if not isinstance(m, dict):
-                continue
-            if "message_id" in m and m["message_id"] in self.waiting:
-                fut = self.waiting[m["message_id"]]
-                if fut.done():
-                    continue
-                if "error_code" in m:
-                    self.partial.pop(m["message_id"], None)
-                    fut.set_exception(MAError(f"{m.get('error_code')}: {m.get('details') or 'failed'}"))
-                elif m.get("partial"):                          # a long listing comes in pieces
-                    self.partial.setdefault(m["message_id"], []).extend(m.get("result") or [])
-                else:
-                    head = self.partial.pop(m["message_id"], None)
-                    fut.set_result(head + list(m.get("result") or []) if head is not None else m.get("result"))
-                continue
-            if "event" in m:
-                ev, oid, data = m.get("event"), m.get("object_id"), m.get("data")
-                if ev in ("player_added", "player_updated") and isinstance(data, dict) and data.get("player_id"):
-                    self.players[data["player_id"]] = data
-                elif ev == "player_removed" and oid:
-                    self.players.pop(oid, None)
-                if ev in ("player_added", "player_updated", "player_removed", "queue_updated"):
-                    self.on_change(oid)
-            elif m.get("error_code") and m.get("message_id") == "connection":
-                raise MAError(m.get("details") or "refused")
-
-
-def media_uri(item):
-    if not isinstance(item, dict):
-        return ""
-    mi = item.get("media_item") if isinstance(item.get("media_item"), dict) else {}
-    return mi.get("uri") or item.get("uri") or ""
-
-
-def queue_pos(q):
-    """Where a queue is in its current item now (seconds)."""
-    pos = float(q.get("elapsed_time") or 0)
-    if q.get("state") == "playing" and q.get("elapsed_time_last_updated"):
-        pos += max(0.0, time.time() - float(q["elapsed_time_last_updated"]))
-    return pos
+            now = self.now_us()
+            wave = None
+            while self.waves and self.due(self.waves[0][0]) <= now:
+                ts, wave = self.waves.popleft()
+            if wave is not None:
+                self.c.plugin_info["last"] = time.monotonic()
+                await self.c.to_page_bytes(WAVE, wave)
+            while self.beats and self.due(self.beats[0][0]) <= now:
+                _, flags = self.beats.popleft()
+                await self.c.to_page_bytes(BEAT, flags)
 
 
 class Channel:
     def __init__(self, r, idx, spec, state):
         self.r, self.idx, self.id, self.name = r, idx, spec["id"], spec["name"]
-        self.follow, self.mode_opt = spec["follow"], spec["mode"]
+        self.player = spec["player"]
         self.sources = {}           # /audio websocket → {id, name, ip, last}: devices that send audio
         self.controllers = set()    # /control websockets: settings pages
         self.viewers = set()        # /stream responses
         self.unwatched_at = -1e9    # when the last viewer left
+        self.watch_event = asyncio.Event()
         self.frame = None           # latest JPEG
         self.frame_event = asyncio.Event()
         self.status = {"type": "status", "presets": [], "preset": "", "fps": 0}
-        self.settings = {}
         self.mac = state["mac"] if isinstance(state.get("mac"), str) else ""
-        server = r.squeezelite_server
-        base = (str(r.opts.get("player_name") or "").strip() or "Visualizer")
-        pname = (base if spec["id"] == "main" else f"{base} {self.name}")[:60]
+        # the built-in Squeezelite player: the single-channel setup only
+        server = r.squeezelite_server if self.id == "main" else ""
+        pname = (str(r.opts.get("player_name") or "").strip() or "Visualizer")[:60]
         self.builtin = {"id": "builtin", "name": pname, "ip": "built-in player", "last": 0.0, "server": server} if server else None
-        self.player = None          # the Squeezelite process
+        self.player_proc = None
+        # Music Assistant's waveform of `player`: one more source to listen to
+        self.plugin_info = {"id": "music-assistant", "name": self.player, "ip": "Music Assistant", "last": 0.0} if self.player else None
+        self.feed = PluginFeed(self) if self.player else None
         if isinstance(state.get("device"), str):
             self.device = state["device"]
         elif spec["device"]:
             self.device = spec["device"]
-        elif self.follow and self.builtin:
-            self.device = self.builtin["name"]     # a follower hears its own player
         else:
             self.device = ""
-        if isinstance(state.get("settings"), dict):
-            self.settings = {k: v for k, v in state["settings"].items() if k in TUNING}
-        self.peak = 0.0             # auto-gain for the built-in player
-        self.mode = None            # follow: "sync" / "mirror", decided once the speaker is seen
-        self.follow_state = "off" if not self.follow else "waiting for Music Assistant"
-        self.mirrored = ""          # the uri the mirror put on the built-in player
-        self.mirror_at = 0.0
-        self.kick_event = asyncio.Event()
+        self.settings = {k: v for k, v in state["settings"].items() if k in TUNING} \
+            if isinstance(state.get("settings"), dict) else {}
+        if self.player and "delayMs" not in self.settings:
+            self.settings["delayMs"] = 0           # the plugin's frames are already timed to the sound
 
-    # ── devices ──────────────────────────────────────────────────────────────
+    def tuning(self):
+        return {**TUNING, **self.settings}
+
+    def watched(self):
+        return bool(self.viewers) or time.monotonic() - self.unwatched_at < GRACE
+
+    def label(self):
+        return f"Channel {self.name}" if self.id != "main" else "Visualizer"
+
+    # ── sources ──────────────────────────────────────────────────────────────
     def wanted(self, info):
         d = self.device.strip().lower()
-        return not d or d in (info["name"].lower(), info["ip"], info["id"])
+        if not d:
+            return True
+        return d in (info["name"].lower(), info["ip"].lower(), info["id"])
 
     def source_list(self):
         now = time.monotonic()
-        infos = list(self.sources.values()) + ([self.builtin] if self.builtin else [])
+        infos = list(self.sources.values()) + [i for i in (self.plugin_info, self.builtin) if i]
         return [{"id": i["id"], "name": i["name"], "ip": i["ip"], "live": now - i["last"] < LIVE_SECONDS}
                 for i in infos]
 
     def control_state(self):
         return {"type": "control", "channel": self.id, "device": self.device, "sources": self.source_list(),
-                "settings": {**TUNING, **self.settings},
-                "follow": {"player": self.follow, "mode": self.mode or self.mode_opt, "state": self.follow_state}}
+                "settings": self.tuning(),
+                "player": None if not self.feed else {"name": self.player, "state": self.feed.state}}
 
     def state(self):
         return {"device": self.device, "settings": self.settings, "mac": self.mac}
@@ -358,8 +381,8 @@ class Channel:
     async def to_page(self, m):
         await self.r.to_page({**m, "ch": self.idx})
 
-    async def to_page_bytes(self, b):
-        await self.r.to_page_bytes(bytes([self.idx]) + b)
+    async def to_page_bytes(self, kind, b):
+        await self.r.to_page_bytes(bytes([self.idx, kind]) + b)
 
     async def command(self, m):
         """A command from the listened-to device or a controller, for the page."""
@@ -378,188 +401,74 @@ class Channel:
 
     async def viewers_changed(self):
         on = bool(self.viewers)
-        if not on:
+        if on:
+            self.watch_event.set()
+            self.watch_event = asyncio.Event()
+        else:
             self.unwatched_at = time.monotonic()
         log(f"{self.label()}: " + ("streaming" if on else "no viewers, paused"))
         await self.to_page({"type": "run", "on": on})
         await self.send_want()
-        self.kick()
 
-    def label(self):
-        return f"Channel {self.name}" if self.id != "main" else "Visualizer"
-
-    # ── the built-in player ──────────────────────────────────────────────────
+    # ── the built-in player (single channel) ─────────────────────────────────
     def player_mac(self):
         if not self.mac:
             self.mac = "02:" + ":".join(f"{random.randrange(256):02x}" for _ in range(5))
             self.r.save_state()
         return self.mac
 
-    async def feed(self, stereo):
-        """Stereo 16-bit samples from the player → the page, as the /audio devices send them (u32 rate + mono int16).
-
-        Auto-gain: Music Assistant may turn the player down (group volume), which would flatten the picture,
-        so its audio is brought up to a steady level."""
+    async def feed_pcm(self, stereo):
+        """Stereo 16-bit samples from the player → the page as u32 rate + mono int16."""
         a = array("h")
         a.frombytes(stereo)
         if sys.byteorder == "big":
             a.byteswap()
         mono = array("h", [(left + right) >> 1 for left, right in zip(a[0::2], a[1::2])])
-        peak = max(max(mono), -min(mono)) if mono else 0
-        loud = peak > 8                                       # real sound, not silence
+        loud = bool(mono) and max(max(mono), -min(mono)) > 8      # real sound, not silence
         if loud:
             self.builtin["last"] = time.monotonic()
-        self.peak = max(float(peak), self.peak * 0.98)
-        if self.peak > 200:
-            gain = min(8.0, 16000.0 / self.peak)
-            if gain > 1.05:
-                mono = array("h", [max(-32768, min(32767, int(v * gain))) for v in mono])
+        # with "any device" the player's silence must not break up another device's audio
         if self.viewers and self.wanted(self.builtin) and (loud or self.device.strip()):
-            await self.to_page_bytes(struct.pack("<I", PLAYER_RATE) + mono.tobytes())
+            await self.to_page_bytes(PCM, struct.pack("<I", PLAYER_RATE) + mono.tobytes())
 
     async def run_player(self):
         if not self.builtin:
             return
         exe = os.environ.get("SQUEEZELITE_BIN") or shutil.which("squeezelite")
         if not exe:
-            log("A Music Assistant server is set but Squeezelite isn't installed")
+            log("squeezelite_server is set but Squeezelite isn't installed")
             return
         while True:
             args = [exe, "-n", self.builtin["name"], "-s", self.builtin["server"], "-m", self.player_mac(),
                     "-o", "-", "-a", "16", "-r", f"{PLAYER_RATE}-{PLAYER_RATE}"]
             log(f"Built-in player \"{self.builtin['name']}\" connecting to {self.builtin['server']}")
-            self.player = await asyncio.create_subprocess_exec(
+            self.player_proc = await asyncio.create_subprocess_exec(
                 *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            logs = asyncio.create_task(self.player_log(self.player.stderr))
+            logs = asyncio.create_task(self.player_log(self.player_proc.stderr))
             try:
                 pending = b""
                 while True:
-                    chunk = await self.player.stdout.read(8192)
+                    chunk = await self.player_proc.stdout.read(8192)
                     if not chunk:
                         break
                     pending += chunk
-                    whole = len(pending) - len(pending) % 4
+                    whole = len(pending) - len(pending) % 4         # whole stereo frames only
                     if whole:
-                        await self.feed(pending[:whole])
+                        await self.feed_pcm(pending[:whole])
                         pending = pending[whole:]
             finally:
                 logs.cancel()
-            rc = await self.player.wait()
-            log(f"Built-in player \"{self.builtin['name']}\" exited ({rc}), restarting in 5 s")
+            rc = await self.player_proc.wait()
+            log(f"Built-in player exited ({rc}), restarting in 5 s")
             await asyncio.sleep(5)
 
     async def player_log(self, stream):
         n = 0
         async for line in stream:
             text = line.decode(errors="replace").strip()
-            if text and n < 200:
+            if text and n < 200:                                    # Squeezelite is chatty when it misbehaves
                 n += 1
-                log(f"squeezelite ({self.builtin['name']}): {text}")
-
-    # ── following a Music Assistant speaker ──────────────────────────────────
-    def kick(self):
-        self.kick_event.set()
-
-    async def set_follow_state(self, s):
-        if s != self.follow_state:
-            self.follow_state = s
-            log(f"{self.label()} following {self.follow}: {s}")
-            await self.control_changed()
-
-    async def run_follow(self):
-        if not self.follow:
-            return
-        if not self.builtin:
-            log(f"{self.label()}: follow is set, but there's no built-in player (set music_assistant)")
-            await self.set_follow_state("needs the built-in player")
-            return
-        while True:
-            try:
-                await asyncio.wait_for(self.kick_event.wait(), FOLLOW_EVERY)
-            except asyncio.TimeoutError:
-                pass
-            self.kick_event.clear()
-            await asyncio.sleep(0.3)                  # let a burst of events settle
-            self.kick_event.clear()
-            try:
-                await self.follow_step(self.r.ma)
-            except MAError as err:
-                await self.set_follow_state(f"error: {err}")
-            except Exception as err:                  # noqa: BLE001 - never let the loop die
-                await self.set_follow_state(f"error: {err!r}")
-
-    async def follow_step(self, ma):
-        if ma is None:
-            return await self.set_follow_state("needs music_assistant in the options")
-        if not ma.ready:
-            return await self.set_follow_state("waiting for Music Assistant" + (f" ({ma.error})" if ma.error else ""))
-        target = ma.find(self.follow)
-        own = ma.find_own(self.builtin["name"], self.mac)
-        if not target:
-            return await self.set_follow_state(f"no player called {self.follow} in Music Assistant")
-        if not own:
-            return await self.set_follow_state("waiting for the built-in player to show up in Music Assistant")
-        tid, oid = target["player_id"], own["player_id"]
-        watched = bool(self.viewers) or time.monotonic() - self.unwatched_at < FOLLOW_GRACE
-        playing = target.get("playback_state") == "playing" and target.get("available", True)
-        want = watched and playing
-        if self.mode is None:
-            if self.mode_opt != "auto":
-                self.mode = self.mode_opt
-            else:
-                cgw = set(target.get("can_group_with") or [])
-                self.mode = "sync" if (oid in cgw or own.get("provider") in cgw) else "mirror"
-            log(f"{self.label()} follows {target.get('name') or tid} by {self.mode}")
-        if self.mode == "sync":
-            leader = target.get("synced_to") or tid
-            joined = own.get("synced_to") == leader or oid in (target.get("group_members") or [])
-            if want and not joined:
-                try:
-                    await ma.call("players/cmd/set_members", target_player=leader, player_ids_to_add=[oid])
-                except MAError as err:
-                    if self.mode_opt == "sync":
-                        raise
-                    log(f"{self.label()}: can't sync with {self.follow} ({err}); mirroring instead")
-                    self.mode = "mirror"
-                    return await self.follow_step(ma)
-                await self.full_volume(ma, oid)
-                return await self.set_follow_state("in sync")
-            if not want and own.get("synced_to"):
-                await ma.call("players/cmd/ungroup", player_id=oid)
-            return await self.set_follow_state("in sync" if want else ("speaker idle" if watched else "nobody watching"))
-        # mirror
-        if not want:
-            if self.mirrored:
-                self.mirrored = ""
-                try:
-                    await ma.call("player_queues/stop", queue_id=oid)
-                except MAError:
-                    pass                                # already stopped
-            return await self.set_follow_state("speaker idle" if watched else "nobody watching")
-        tq = await ma.call("player_queues/get_active_queue", player_id=tid)
-        uri = media_uri((tq or {}).get("current_item"))
-        if not uri:
-            return await self.set_follow_state("the speaker plays something Music Assistant can't share")
-        oq = await ma.call("player_queues/get", queue_id=oid) or {}
-        pos = queue_pos(tq)
-        if media_uri(oq.get("current_item")) != uri or oq.get("state") != "playing":
-            if self.mirrored == uri and oq.get("state") != "playing" and self.mirror_at > time.monotonic() - 8:
-                return                                  # just started it: give it a moment
-            log(f"{self.label()}: mirroring {uri}")
-            await ma.call("player_queues/play_media", queue_id=oid, media=uri, option="replace")
-            self.mirrored, self.mirror_at = uri, time.monotonic()
-            await self.full_volume(ma, oid)
-            return await self.set_follow_state("mirroring")
-        duration = (tq.get("current_item") or {}).get("duration") or 0
-        if duration and abs(queue_pos(oq) - pos) > MIRROR_DRIFT and pos < duration - 5:
-            await ma.call("player_queues/seek", queue_id=oid, position=int(pos))
-        await self.set_follow_state("mirroring")
-
-    async def full_volume(self, ma, oid):
-        try:
-            await ma.call("players/cmd/volume_set", player_id=oid, volume_level=100)
-        except MAError:
-            pass                                        # auto-gain covers it
+                log(f"squeezelite: {text}")
 
 
 class Renderer:
@@ -569,8 +478,10 @@ class Renderer:
         self.gl = ""
         self.gpu = bool(opts.get("gpu", True))
         self.chromium = None
+        self.squeezelite_server = str(opts.get("squeezelite_server") or "").strip()
         ma = str(opts.get("music_assistant") or "").strip()
-        self.squeezelite_server = str(opts.get("squeezelite_server") or "").strip() or (host_of(ma) if ma else "")
+        token = str(opts.get("music_assistant_token") or "").strip()
+        self.ma = MusicAssistant(ma, token) if ma and token else None
         state = load_state()
         chstate = state.get("channels") if isinstance(state.get("channels"), dict) else {}
         specs = channel_specs(opts)
@@ -579,8 +490,6 @@ class Renderer:
         self.channels = [Channel(self, i, s, chstate.get(s["id"]) if isinstance(chstate.get(s["id"]), dict) else {})
                          for i, s in enumerate(specs)]
         self.by_id = {c.id: c for c in self.channels}
-        token = str(opts.get("music_assistant_token") or "").strip()
-        self.ma = MusicAssistant(ma, token, self.ma_changed) if ma else None
 
     def save_state(self):
         try:
@@ -588,11 +497,6 @@ class Renderer:
             STATE_FILE.write_text(json.dumps({"channels": {c.id: c.state() for c in self.channels}}))
         except OSError as err:
             log(f"Could not save {STATE_FILE}: {err}")
-
-    def ma_changed(self, _object_id):
-        for c in self.channels:
-            if c.follow:
-                c.kick()
 
     def channel(self, request):
         """The channel a request is for (?channel=…), or None."""
@@ -611,8 +515,7 @@ class Renderer:
         await self.to_page({"type": "config", "width": o["width"], "height": o["height"], "fps": o["fps"],
                             "jpeg_quality": o["jpeg_quality"], "channels": len(self.channels)})
         for c in self.channels:
-            if c.settings:
-                await c.to_page({"type": "settings", **c.settings})
+            await c.to_page({"type": "settings", **c.tuning()})
             await c.to_page({"type": "run", "on": bool(c.viewers)})
         try:
             async for msg in ws:
@@ -673,7 +576,7 @@ class Renderer:
                 if msg.type == WSMsgType.BINARY:
                     info["last"] = time.monotonic()
                     if c.viewers and c.wanted(info):
-                        await c.to_page_bytes(msg.data)
+                        await c.to_page_bytes(PCM, msg.data)
                 elif msg.type == WSMsgType.TEXT:
                     m = json.loads(msg.data)
                     if m.get("type") == "hello":
@@ -720,6 +623,7 @@ class Renderer:
         return ws
 
     async def ticker(self):
+        """Settings pages see which sources are live right now."""
         while True:
             await asyncio.sleep(2)
             for c in self.channels:
@@ -773,12 +677,10 @@ class Renderer:
         c = self.channel(request) or self.channels[0]
         return web.json_response({**c.status, "gl": self.gl, "viewers": len(c.viewers), "devices": len(c.sources),
                                   "page": self.page is not None, "device": c.device, "sources": c.source_list(),
-                                  "channel": c.id, "follow": c.control_state()["follow"],
-                                  "music_assistant": None if self.ma is None else
-                                  {"connected": self.ma.ready, "error": self.ma.error},
+                                  "channel": c.id, "player": c.control_state()["player"],
                                   "channels": [{"id": x.id, "name": x.name, "viewers": len(x.viewers),
-                                                "player": x.builtin["name"] if x.builtin else None,
-                                                "follow": x.follow, "state": x.follow_state}
+                                                "player": x.player or None,
+                                                "feed": x.feed.state if x.feed else None}
                                                for x in self.channels]})
 
     # ── headless Chromium, kept running ─────────────────────────────────────
@@ -789,7 +691,7 @@ class Renderer:
             return
         w, h = int(self.opts["width"]), int(self.opts["height"])
         while True:
-            if os.environ.get("CHROMIUM_GL_FLAGS"):
+            if os.environ.get("CHROMIUM_GL_FLAGS"):        # for testing elsewhere
                 gl = os.environ["CHROMIUM_GL_FLAGS"].split()
             elif self.gpu:
                 gl = ["--enable-gpu", "--use-angle=vulkan", "--enable-features=Vulkan",
@@ -815,17 +717,17 @@ class Renderer:
     async def start(self, app):
         tasks = [self.run_chromium(), self.ticker()]
         for c in self.channels:
-            tasks += [c.run_player(), c.run_follow()]
-        if self.ma:
-            tasks.append(self.ma.run())
+            tasks.append(c.run_player())
+            if c.feed:
+                tasks.append(c.feed.run())
         app["tasks"] = [asyncio.create_task(t) for t in tasks]
 
     async def stop(self, app):
         for t in app["tasks"]:
             t.cancel()
         for c in self.channels:
-            if c.player and c.player.returncode is None:
-                c.player.kill()
+            if c.player_proc and c.player_proc.returncode is None:
+                c.player_proc.kill()
         if self.chromium and self.chromium.returncode is None:
             self.chromium.kill()
 
@@ -843,7 +745,7 @@ def main():
     app.router.add_static("/", WWW)
     app.on_startup.append(r.start)
     app.on_cleanup.append(r.stop)
-    names = ", ".join(c.name or c.id for c in r.channels)
+    names = ", ".join((c.name or c.id) + (f" ← {c.player}" if c.player else "") for c in r.channels)
     log(f"Milkdrop renderer on port {PORT}: {opts['width']}×{opts['height']} at up to {opts['fps']} fps; channels: {names}")
     web.run_app(app, host=os.environ.get("MILKDROP_HOST", "0.0.0.0"), port=PORT, print=None, access_log=None)
 

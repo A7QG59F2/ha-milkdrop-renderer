@@ -1,8 +1,9 @@
 # Milkdrop renderer (Home Assistant app)
 
 A Home Assistant app that draws the Milkdrop visualizer (butterchurn) on the Home Assistant machine's GPU and
-streams it, as a small video, to a kiosk or screen that is too weak to draw it itself. It can follow Music Assistant
-speakers by itself, with a separate visualizer (channel) per speaker.
+streams it, as a small video, to a kiosk or screen that is too weak to draw it itself. It takes each speaker's audio
+from Music Assistant's MilkDrop Visualizer plugin (or from a device that sends it), with a separate visualizer
+(channel) per speaker.
 
 Add it in **Settings → Apps → App store → ⋮ → Repositories** with `https://github.com/A7QG59F2/ha-milkdrop-renderer`,
 then install **Milkdrop renderer**. Setup and options: [milkdrop-renderer/DOCS.md](milkdrop-renderer/DOCS.md).
@@ -12,7 +13,7 @@ then install **Milkdrop renderer**. Setup and options: [milkdrop-renderer/DOCS.m
 ```bash
 python3 test/test_audio_device.py    # needs python3-aiohttp; starts renderer.py without Chromium
 python3 test/test_builtin_player.py  # the built-in player, with a stand-in for Squeezelite
-python3 test/test_follow.py          # channels and following speakers, with a stand-in Music Assistant
+python3 test/test_plugin_feed.py     # channels fed by a stand-in Music Assistant plugin
 FALSY_WS=1 python3 test/test_builtin_player.py   # the same, with older aiohttp's behaviour
 ```
 

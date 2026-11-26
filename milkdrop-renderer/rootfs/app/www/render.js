@@ -1,7 +1,9 @@
 // Runs in the renderer's headless Chromium: draws Milkdrop for every channel
 // (one canvas and one butterchurn each) from that channel's audio, and sends
 // each frame to renderer.py as a JPEG. On the link, text messages carry "ch"
-// (the channel's index); binary messages start with one byte, the index.
+// (the channel's index); binary messages are [ch][kind][data]: kind 1 = PCM
+// (u32 rate + int16 mono), 2 = a waveform ready to draw (1024 × uint8, from
+// Music Assistant, already timed to the sound), 3 = a beat.
 "use strict";
 
 const cfg = { w: 640, h: 400, fps: 30, quality: 0.8 };
@@ -19,6 +21,7 @@ class Chan {
       run: false, cycle: 30, minFps: 0, delayMs: 200, loaded: 0, judgeFrom: Infinity, judgeFrames: 0,
       slow: new Set(), busy: false, frames: 0, fpsT: 0, shownFps: 0, last: 0,
       ring: new Int16Array(1 << 17), written: 0, rate: 48000, lastPush: 0, timeBytes: new Uint8Array(1024),
+      wave: new Uint8Array(1024), lastWave: 0, lastBeat: 0,
     });
     this.viz = bc.createVisualizer(new AudioContext(), this.canvas, {
       width: cfg.w, height: cfg.h, pixelRatio: 1, textureRatio: 1,
@@ -35,8 +38,18 @@ class Chan {
     this.written += s.length;
     this.lastPush = performance.now();
   }
+  setWave(buf) {
+    this.wave.set(new Uint8Array(buf, 0, Math.min(1024, buf.byteLength)));
+    this.lastWave = performance.now();
+  }
+  beat() {
+    this.lastBeat = performance.now();
+    // a preset change that is due waits for the beat
+    if (this.cycle > 0 && this.lastBeat - this.loaded > this.cycle * 1000) this.next();
+  }
   samples() {
     const now = performance.now(), tb = this.timeBytes;
+    if (now - this.lastWave < 500) return this.wave;
     if (now - this.lastPush > 1000) return tb.fill(128);
     // The device sends samples ahead of what's heard (Bluetooth delay); hold back
     const behind = Math.max(0, ((this.lastPush + this.delayMs - now) * this.rate) / 1000);
@@ -106,7 +119,9 @@ class Chan {
         if (this.judgeFrames / secs < this.minFps) { this.slow.add(this.names[this.idx]); this.next(0); return; }
       }
     }
-    if (this.cycle > 0 && t - this.loaded > this.cycle * 1000) this.next();
+    // without beats (or when none come), change by the clock
+    const over = t - this.loaded - this.cycle * 1000;
+    if (this.cycle > 0 && over > 0 && (t - this.lastBeat > 4000 || over > 8000)) this.next();
   }
 
   handle(m) {
@@ -156,9 +171,12 @@ function connect() {
   sock.binaryType = "arraybuffer";
   sock.onmessage = (e) => {
     if (e.data instanceof ArrayBuffer) {
-      const ch = chans[new Uint8Array(e.data, 0, 1)[0]];
-      // copy past the channel byte, so the samples start on an even offset
-      if (ch && e.data.byteLength > 5) ch.push(e.data.slice(1));
+      const [i, kind] = new Uint8Array(e.data, 0, 2), ch = chans[i];
+      if (!ch) return;
+      // copy past the two header bytes, so the samples start on an even offset
+      if (kind === 1 && e.data.byteLength > 6) ch.push(e.data.slice(2));
+      else if (kind === 2) ch.setWave(e.data.slice(2));
+      else if (kind === 3) ch.beat();
       return;
     }
     const m = JSON.parse(e.data);

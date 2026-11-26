@@ -4,6 +4,21 @@ Newest first.
 
 ## Unreleased
 
+## 0.5.0
+
+- **Music Assistant's own MilkDrop Visualizer plugin feeds the visualizer** (`music_assistant`,
+  `music_assistant_token`, and `player` on a channel). The app takes the waveform Music Assistant already decodes
+  for a player, timed to when it is heard, so it works with every player (Squeezelite, Echo, Cast, Sendspin…) with
+  no grouping, no extra player and no second stream. This replaces 0.4.0's following (sync/mirror with a built-in
+  player per channel).
+- Presets change on a beat when Music Assistant knows the beats.
+- A channel fed by Music Assistant starts with an audio delay of 0 (its frames are already timed to the sound).
+
+  After merging: update the app, turn on **MilkDrop Visualizer** in Music Assistant (Settings → Plugins). In the
+  options, rename each channel's `follow` to `player` (`follow` still works) and remove `mode` if you set it. The
+  per-channel built-in players ("Visualizer Garage", …) are gone: remove them in Music Assistant. The single
+  built-in "Visualizer" player (`squeezelite_server`, no channels) still works but isn't needed any more.
+
 ## 0.4.0
 
 - **Channels**: several visualizers at once, one per speaker (`channels` option). Each has its own picture
