@@ -1,5 +1,5 @@
-// Runs in the renderer's headless Chromium: draws Milkdrop from the Odroid's
-// audio samples and sends each frame to renderer.py as a JPEG.
+// Runs in the renderer's headless Chromium: draws Milkdrop from an audio
+// device's samples and sends each frame to renderer.py as a JPEG.
 "use strict";
 
 const canvas = document.getElementById("c");
@@ -10,7 +10,7 @@ const st = {
   slow: new Set(), busy: false, frames: 0, fpsT: 0, shownFps: 0, last: 0,
 };
 
-// ── Audio from the Odroid: u32 rate + int16 mono, kept in a ring ───────────
+// ── Audio from the device: u32 rate + int16 mono, kept in a ring ───────────
 const ring = new Int16Array(1 << 17);
 let written = 0, rate = 48000, lastPush = 0;
 function push(buf) {
@@ -26,7 +26,7 @@ const timeBytes = new Uint8Array(1024);
 function samples() {
   const now = performance.now();
   if (now - lastPush > 1000) return timeBytes.fill(128);
-  // The Odroid sends samples ahead of what's heard (Bluetooth delay); hold back
+  // The device sends samples ahead of what's heard (Bluetooth delay); hold back
   const behind = Math.max(0, ((lastPush + st.delayMs - now) * rate) / 1000);
   const end = Math.floor(written - behind), mask = ring.length - 1;
   for (let i = 0; i < timeBytes.length; i++) {

@@ -3,7 +3,7 @@ FROM $BUILD_FROM
 
 # Chromium draws Milkdrop (butterchurn, WebGL 2) on the GPU through Mesa's
 # Vulkan drivers, or on the CPU with SwiftShader when that fails; aiohttp
-# serves the page, takes the Odroid's audio and streams the frames.
+# serves the page, takes the audio devices' audio and streams the frames.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends chromium python3-aiohttp fonts-dejavu-core ca-certificates curl \
         mesa-vulkan-drivers libvulkan1 libgl1-mesa-dri libegl1 \

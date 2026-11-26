@@ -1,8 +1,8 @@
 # Milkdrop renderer (Home Assistant app)
 
-A Home Assistant app that draws the Milkdrop visualizer for the Winamp remote of
-[ODroid-C2](https://github.com/A7QG59F2/ODroid-C2) on the Home Assistant machine's GPU and streams it to the
-Odroid's kiosk.
+A Home Assistant app that draws the Milkdrop visualizer (butterchurn) on the Home Assistant machine's GPU and
+streams it, as a small video, to a kiosk or screen that is too weak to draw it itself. A device that plays the
+music sends its audio here.
 
 Add it in **Settings → Apps → App store → ⋮ → Repositories** with `https://github.com/A7QG59F2/ha-milkdrop-renderer`,
 then install **Milkdrop renderer**. Setup and options: [milkdrop-renderer/DOCS.md](milkdrop-renderer/DOCS.md).
