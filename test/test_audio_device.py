@@ -1,6 +1,6 @@
 """Which device the audio is heard from, and the /control socket, against the real renderer.py
 (no Chromium needed: CHROMIUM_BIN points at /bin/false). Run: python3 test/test_audio_device.py"""
-import asyncio, json, os, subprocess, sys, tempfile, time
+import asyncio, atexit, json, os, subprocess, sys, tempfile, time
 import aiohttp
 
 APP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "milkdrop-renderer", "rootfs", "app", "renderer.py")
@@ -10,7 +10,9 @@ env = {**os.environ, "MILKDROP_PORT": "18098", "MILKDROP_HOST": "127.0.0.1", "ST
 open(f"{tmp}/opts.json", "w").write(json.dumps({"audio_device": "player-1"}))
 
 def start():
-    return subprocess.Popen([sys.executable, APP], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.Popen([sys.executable, APP], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    atexit.register(proc.kill)                           # never leave one running after a failed test
+    return proc
 
 async def recv_until(ws, pred, secs=3):
     end = time.time() + secs

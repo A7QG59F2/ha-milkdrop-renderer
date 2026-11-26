@@ -111,7 +111,7 @@ class Renderer:
     async def page_ws(self, request):
         ws = web.WebSocketResponse(max_msg_size=8 << 20)
         await ws.prepare(request)
-        if self.page and not self.page.closed:
+        if self.page is not None and not self.page.closed:
             await self.page.close()
         self.page = ws
         log("Render page connected")
@@ -147,11 +147,11 @@ class Renderer:
         return ws
 
     async def to_page(self, m):
-        if self.page and not self.page.closed:
+        if self.page is not None and not self.page.closed:
             await self.page.send_str(json.dumps(m))
 
     async def to_page_bytes(self, b):
-        if self.page and not self.page.closed:
+        if self.page is not None and not self.page.closed:
             await self.page.send_bytes(b)
 
     # ── the devices: audio in, commands in, status out ──────────────────────
@@ -379,7 +379,7 @@ class Renderer:
 
     async def status_json(self, _request):
         return web.json_response({**self.status, "gl": self.gl, "viewers": len(self.viewers),
-                                  "devices": len(self.sources), "page": bool(self.page),
+                                  "devices": len(self.sources), "page": self.page is not None,
                                   "device": self.device, "sources": self.source_list()})
 
     # ── headless Chromium, kept running ─────────────────────────────────────
